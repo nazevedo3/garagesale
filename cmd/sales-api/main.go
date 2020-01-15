@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -10,11 +11,34 @@ import (
 	"time"
 
 	"github.com/nazevedo3/garagesale/cmd/sales-api/internal/handlers"
+	"github.com/pkg/errors"
 
+	"github.com/nazevedo3/garagesale/internal/platform/conf"
 	"github.com/nazevedo3/garagesale/internal/platform/database"
 )
 
 func main() {
+	if err := run(); err != nil {
+		log.Fatal(err)
+	}
+}
+
+func run() error {
+	var cfg struct {
+		Web struct {
+			Address         string        `conf:"default:localhost:8000"`
+			ReadTimeout     time.Duration `conf:"default:5s"`
+			WriteTimeout    time.Duration `conf:"default:5s"`
+			ShutdownTimeout time.Duration `conf:"default:5s"`
+		}
+		DB struct {
+			User       string `conf:"default:postgres"`
+			Password   string `conf:"default:postgres,noprint"`
+			Host       string `conf:"default:localhost"`
+			Name       string `conf:"default:postgres"`
+			DisableTLS bool   `conf:"default:false"`
+		}
+	}
 
 	// =========================================================================
 	// App Starting
@@ -23,11 +47,38 @@ func main() {
 	defer log.Println("main : Completed")
 
 	// =========================================================================
+	// Get configuration
+
+	if err := conf.Parse(os.Args[1:], "SALES", &cfg); err != nil {
+		if err == conf.ErrHelpWanted {
+			usage, err := conf.Usage("SALES", &cfg)
+			if err != nil {
+				return errors.Wrap(err, "generating config usage")
+			}
+			fmt.Println(usage)
+			return nil
+		}
+		return errors.Wrap(err, "parsing config")
+	}
+
+	out, err := conf.String(&cfg)
+	if err != nil {
+		return errors.Wrap(err, "generating config for ouput")
+	}
+	log.Printf("main : Config :\n%v\n", out)
+
+	// =========================================================================
 	// Setup Dependencies
 
-	db, err := database.Open()
+	db, err := database.Open(database.Config{
+		Host:       cfg.DB.Host,
+		User:       cfg.DB.User,
+		Password:   cfg.DB.Password,
+		Name:       cfg.DB.Name,
+		DisableTLS: cfg.DB.DisableTLS,
+	})
 	if err != nil {
-		log.Fatal(err)
+		return errors.Wrap(err, "opening DB")
 	}
 
 	defer db.Close()
@@ -38,10 +89,10 @@ func main() {
 	ps := handlers.Product{Db: db}
 
 	api := http.Server{
-		Addr:         "localhost:8000",
+		Addr:         cfg.Web.Address,
 		Handler:      http.HandlerFunc(ps.List),
-		ReadTimeout:  5 * time.Second,
-		WriteTimeout: 5 * time.Second,
+		ReadTimeout:  cfg.Web.ReadTimeout,
+		WriteTimeout: cfg.Web.WriteTimeout,
 	}
 
 	// Make a channel to listen for errors coming from the listener. Use a
@@ -65,25 +116,26 @@ func main() {
 	// Blocking main and waiting for shutdown.
 	select {
 	case err := <-serverErrors:
-		log.Fatalf("error: listening and serving: %s", err)
+		return errors.Wrap(err, "listening and serving")
 
 	case <-shutdown:
 		log.Println("main : Start shutdown")
 
 		// Give outstanding requests a deadline for completion.
-		const timeout = 5 * time.Second
-		ctx, cancel := context.WithTimeout(context.Background(), timeout)
+
+		ctx, cancel := context.WithTimeout(context.Background(), cfg.Web.ShutdownTimeout)
 		defer cancel()
 
 		// Asking listener to shutdown and load shed.
 		err := api.Shutdown(ctx)
 		if err != nil {
-			log.Printf("main : Graceful shutdown did not complete in %v : %v", timeout, err)
+			log.Printf("main : Graceful shutdown did not complete in %v : %v", cfg.Web.ShutdownTimeout, err)
 			err = api.Close()
 		}
 
 		if err != nil {
-			log.Fatalf("main : could not stop server gracefully : %v", err)
+			return errors.Wrap(err, "graceful shutdown")
 		}
 	}
+	return nil
 }
